@@ -1,0 +1,109 @@
+---
+  - hosts: all
+    become: true
+    tasks:
+
+      - name: Percona repo
+        yum:
+          name: 
+          - https://repo.percona.com/yum/percona-release-latest.noarch.rpm
+          - http://repo.percona.com/centos/7/RPMS/x86_64/Percona-Server-selinux-56-5.6.42-rel84.2.el7.noarch.rpm
+          - MySQL-python
+          state: present
+
+      - name: percona server
+        yum:
+          name: Percona-Server-server-57
+          state: latest
+
+      - name: config
+        template:
+          src: "{{ item.src }}"
+          dest: "{{ item.dst }}"
+          owner: root
+          group: root
+          mode: '0644'
+        with_items:
+          - { src: 01-base.cnf.j2, dst: "/etc/my.cnf.d/01-base.cnf" }
+          - { src: 02-max-connections.cnf.j2, dst: "/etc/my.cnf.d/02-max-connections.cnf" }
+          - { src: 03-performance.cnf.j2, dst: "/etc/my.cnf.d/03-performance.cnf" }
+          - { src: 04-slow-query.cnf.j2, dst: "/etc/my.cnf.d/04-slow-query.cnf" }
+          - { src: 05-binlog.cnf.j2, dst: "/etc/my.cnf.d/05-binlog.cnf" }
+          - { src: my.cnf.j2, dst: "/root/.my.cnf" }
+      
+      - name: slave config
+        replace:
+          path: /etc/my.cnf.d/05-binlog.cnf
+          regexp: "{{ item.regexp }}"
+          replace: "{{ item.replace }}"
+        with_items:
+          - { regexp: '^#replicate-ignore-table=bet.events_on_demand', replace: 'replicate-ignore-table=bet.events_on_demand' }
+          - { regexp: '^#replicate-ignore-table=bet.v_same_event', replace: 'replicate-ignore-table=bet.v_same_event' }
+        when: not is_master
+
+      - name: start mysql
+        systemd:
+          name: mysql
+          state: started
+          enabled: yes
+
+      - name: temp password
+        shell: "cat /var/log/mysqld.log | grep 'root@localhost:' | awk '{print $11}'"
+        register: temppass
+
+      - name: set password
+        shell: mysql -u root -p'{{ temppass.stdout }}' -Nse 'ALTER USER root@localhost IDENTIFIED BY "{{ pass }}";' --connect-expired-password
+        ignore_errors: yes
+
+      - name: create bet
+        mysql_db: 
+          login_unix_socket: /var/lib/mysql/mysql.sock
+          name: bet
+          state: present
+        when: is_master
+
+      - name: import bet
+        mysql_db:
+          name: bet
+          state: import
+          target: /vagrant/bet.dmp
+        when: is_master
+
+      - name: replication user
+        mysql_user:
+          name: repl
+          host: "%"
+          password: "!OtusLinux2018"
+          priv: '*.*:REPLICATION SLAVE'
+          state: present
+        when: is_master
+
+      - name: slave conf
+        mysql_replication:
+          mode: changemaster
+          master_host: 192.168.11.150
+          master_port: 3306
+          master_user: repl
+          master_password: "!OtusLinux2018"
+          master_auto_position: 1
+        when: not is_master
+
+      - name: Start slave
+        mysql_replication:
+          mode: startslave
+        when: not is_master
+
+      - name: wait
+        pause:
+          seconds: 10
+
+      - name: replication status
+        shell: "mysql -u root -p'{{ pass }}' -Bse \" SHOW SLAVE STATUS\\G\" "
+        register: repl_stat
+        when: not is_master
+
+      - name: show status
+        debug: 
+          var: repl_stat.stdout_lines
+        when: repl_stat.stdout_lines is defined
+
